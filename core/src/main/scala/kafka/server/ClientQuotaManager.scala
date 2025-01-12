@@ -19,20 +19,20 @@ package kafka.server
 import java.{lang, util}
 import java.util.concurrent.{ConcurrentHashMap, DelayQueue, TimeUnit}
 import java.util.concurrent.locks.ReentrantReadWriteLock
-
+import java.util.function.Consumer
 import kafka.network.RequestChannel
-import kafka.network.RequestChannel._
 import kafka.server.ClientQuotaManager._
-import kafka.utils.{Logging, QuotaUtils}
+import kafka.utils.Logging
 import org.apache.kafka.common.{Cluster, MetricName}
 import org.apache.kafka.common.metrics._
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.metrics.stats.{Avg, CumulativeSum, Rate}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.utils.{Sanitizer, Time}
-import org.apache.kafka.server.config.{ConfigEntityName, ClientQuotaManagerConfig}
-import org.apache.kafka.server.quota.{ClientQuotaCallback, ClientQuotaEntity, ClientQuotaType}
+import org.apache.kafka.server.config.{ClientQuotaManagerConfig, ZooKeeperInternals}
+import org.apache.kafka.server.quota.{ClientQuotaCallback, ClientQuotaEntity, ClientQuotaType, QuotaType, QuotaUtils, SensorAccess, ThrottleCallback, ThrottledChannel}
 import org.apache.kafka.server.util.ShutdownableThread
+import org.apache.kafka.network.Session
 
 import scala.jdk.CollectionConverters._
 
@@ -56,9 +56,9 @@ object ClientQuotaManager {
   // Purge sensors after 1 hour of inactivity
   val InactiveSensorExpirationTimeSeconds = 3600
 
-  val DefaultClientIdQuotaEntity = KafkaQuotaEntity(None, Some(DefaultClientIdEntity))
-  val DefaultUserQuotaEntity = KafkaQuotaEntity(Some(DefaultUserEntity), None)
-  val DefaultUserClientIdQuotaEntity = KafkaQuotaEntity(Some(DefaultUserEntity), Some(DefaultClientIdEntity))
+  val DefaultClientIdQuotaEntity: KafkaQuotaEntity = KafkaQuotaEntity(None, Some(DefaultClientIdEntity))
+  val DefaultUserQuotaEntity: KafkaQuotaEntity = KafkaQuotaEntity(Some(DefaultUserEntity), None)
+  val DefaultUserClientIdQuotaEntity: KafkaQuotaEntity = KafkaQuotaEntity(Some(DefaultUserEntity), Some(DefaultClientIdEntity))
 
   sealed trait BaseUserEntity extends ClientQuotaEntity.ConfigEntity
 
@@ -76,13 +76,13 @@ object ClientQuotaManager {
 
   case object DefaultUserEntity extends BaseUserEntity {
     override def entityType: ClientQuotaEntity.ConfigEntityType = ClientQuotaEntity.ConfigEntityType.DEFAULT_USER
-    override def name: String = ConfigEntityName.DEFAULT
+    override def name: String = ZooKeeperInternals.DEFAULT_STRING
     override def toString: String = "default user"
   }
 
   case object DefaultClientIdEntity extends ClientQuotaEntity.ConfigEntity {
     override def entityType: ClientQuotaEntity.ConfigEntityType = ClientQuotaEntity.ConfigEntityType.DEFAULT_CLIENT_ID
-    override def name: String = ConfigEntityName.DEFAULT
+    override def name: String = ZooKeeperInternals.DEFAULT_STRING
     override def toString: String = "default client-id"
   }
 
@@ -93,7 +93,7 @@ object ClientQuotaManager {
 
     def sanitizedUser: String = userEntity.map {
       case entity: UserEntity => entity.sanitizedUser
-      case DefaultUserEntity => ConfigEntityName.DEFAULT
+      case DefaultUserEntity => ZooKeeperInternals.DEFAULT_STRING
     }.getOrElse("")
 
     def clientId: String = clientIdEntity.map(_.name).getOrElse("")
@@ -351,7 +351,7 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
       sensorAccessor.getOrCreate(
         getQuotaSensorName(metricTags),
         ClientQuotaManager.InactiveSensorExpirationTimeSeconds,
-        registerQuotaMetrics(metricTags)
+        sensor => registerQuotaMetrics(metricTags)(sensor)
       ),
       sensorAccessor.getOrCreate(
         getThrottleTimeSensorName(metricTags),
@@ -392,7 +392,7 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
       .quota(new Quota(quotaLimit, true))
   }
 
-  protected def getOrCreateSensor(sensorName: String, expirationTimeSeconds: Long, registerMetrics: Sensor => Unit): Sensor = {
+  protected def getOrCreateSensor(sensorName: String, expirationTimeSeconds: Long, registerMetrics: Consumer[Sensor]): Sensor = {
     sensorAccessor.getOrCreate(
       sensorName,
       expirationTimeSeconds,
@@ -419,11 +419,11 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
     lock.writeLock().lock()
     try {
       val userEntity = sanitizedUser.map {
-        case ConfigEntityName.DEFAULT => DefaultUserEntity
+        case ZooKeeperInternals.DEFAULT_STRING => DefaultUserEntity
         case user => UserEntity(user)
       }
       val clientIdEntity = sanitizedClientId.map {
-        case ConfigEntityName.DEFAULT => DefaultClientIdEntity
+        case ZooKeeperInternals.DEFAULT_STRING => DefaultClientIdEntity
         case _ => ClientIdEntity(clientId.getOrElse(throw new IllegalStateException("Client-id not provided")))
       }
       val quotaEntity = KafkaQuotaEntity(userEntity, clientIdEntity)
@@ -534,7 +534,7 @@ class ClientQuotaManager(private val config: ClientQuotaManagerConfig,
     throttledChannelReaper.awaitShutdown()
   }
 
-  class DefaultQuotaCallback extends ClientQuotaCallback {
+  private class DefaultQuotaCallback extends ClientQuotaCallback {
     private val overriddenQuotas = new ConcurrentHashMap[ClientQuotaEntity, Quota]()
 
     override def configure(configs: util.Map[String, _]): Unit = {}
