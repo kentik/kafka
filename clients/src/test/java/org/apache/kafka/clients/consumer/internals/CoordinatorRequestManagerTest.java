@@ -18,7 +18,7 @@ package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.ClientResponse;
 import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
-import org.apache.kafka.clients.consumer.internals.events.ErrorBackgroundEvent;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.errors.GroupAuthorizationException;
 import org.apache.kafka.common.errors.TimeoutException;
@@ -28,15 +28,25 @@ import org.apache.kafka.common.requests.AbstractRequest;
 import org.apache.kafka.common.requests.FindCoordinatorRequest;
 import org.apache.kafka.common.requests.FindCoordinatorResponse;
 import org.apache.kafka.common.requests.RequestHeader;
+import org.apache.kafka.common.utils.LogCaptureAppender;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.MockTime;
+
+import org.apache.logging.log4j.Level;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -71,6 +81,78 @@ public class CoordinatorRequestManagerTest {
 
         NetworkClientDelegate.PollResult pollResult = coordinatorManager.poll(time.milliseconds());
         assertEquals(Collections.emptyList(), pollResult.unsentRequests);
+    }
+
+    /**
+     * This test mimics a client that has been disconnected from the coordinator. When the client remains disconnected
+     * from the coordinator for 60 seconds, the client will begin to emit a warning log every minute thereafter to
+     * alert the user about the ongoing disconnect status. The warning log includes the length of time of the ongoing
+     * disconnect:
+     *
+     * <code>
+     *     Consumer has been disconnected from the group coordinator for XXXXXms
+     * </code>
+     *
+     * <p/>
+     *
+     * However, the logic used to calculate the length of the disconnect was not correct. This test exercises the
+     * disconnect logic, controlling the logging and system time, to ensure the warning message is correct.
+     *
+     * @see CoordinatorRequestManager#markCoordinatorUnknown(String, long)
+     */
+    @Test
+    public void testMarkCoordinatorUnknownLoggingAccuracy() {
+        long oneMinute = 60000;
+
+        try (final LogCaptureAppender appender = LogCaptureAppender.createAndRegister()) {
+            // You'd be forgiven for assuming that a warning message would be logged at WARN, but
+            // markCoordinatorUnknown logs the warning at DEBUG. This is partly for historical parity with the
+            // ClassicKafkaConsumer.
+            appender.setClassLogger(CoordinatorRequestManager.class, Level.DEBUG);
+            CoordinatorRequestManager coordinatorRequestManager = setupCoordinatorManager(GROUP_ID);
+            assertFalse(coordinatorRequestManager.coordinator().isPresent());
+
+            // Step 1: mark the coordinator as disconnected right after creation of the CoordinatorRequestManager.
+            // Because the disconnect occurred immediately, no warning should be logged.
+            coordinatorRequestManager.markCoordinatorUnknown("test", time.milliseconds());
+            assertTrue(millisecondsFromLog(appender).isEmpty());
+
+            // Step 2: sleep for one minute and mark the coordinator unknown again. Then verify that the warning was
+            // logged and the reported time is accurate.
+            time.sleep(oneMinute);
+            coordinatorRequestManager.markCoordinatorUnknown("test", time.milliseconds());
+            Optional<Long> firstLogMs = millisecondsFromLog(appender);
+            assertTrue(firstLogMs.isPresent());
+            assertEquals(oneMinute, firstLogMs.get());
+
+            // Step 3: sleep for *another* minute, mark the coordinator unknown again, and verify the accuracy.
+            time.sleep(oneMinute);
+            coordinatorRequestManager.markCoordinatorUnknown("test", time.milliseconds());
+            Optional<Long> secondLogMs = millisecondsFromLog(appender);
+            assertTrue(secondLogMs.isPresent());
+            assertEquals(oneMinute * 2, secondLogMs.get());
+        }
+    }
+
+    private Optional<Long> millisecondsFromLog(LogCaptureAppender appender) {
+        Pattern pattern = Pattern.compile("\\s+(?<millis>\\d+)+ms");
+        List<Long> milliseconds = appender.getMessages().stream()
+            .map(pattern::matcher)
+            .filter(Matcher::find)
+            .map(matcher -> matcher.group("millis"))
+            .filter(Objects::nonNull)
+            .map(millisString -> {
+                try {
+                    return Long.parseLong(millisString);
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            })
+            .filter(Objects::nonNull)
+            .collect(Collectors.toList());
+
+        // Return the most recent log entry that matches the message in markCoordinatorUnknown, if present.
+        return milliseconds.isEmpty() ? Optional.empty() : Optional.of(milliseconds.get(milliseconds.size() - 1));
     }
 
     @Test
@@ -114,10 +196,10 @@ public class CoordinatorRequestManagerTest {
         expectFindCoordinatorRequest(coordinatorManager, Errors.GROUP_AUTHORIZATION_FAILED);
 
         verify(backgroundEventHandler).add(argThat(backgroundEvent -> {
-            if (!(backgroundEvent instanceof ErrorBackgroundEvent))
+            if (!(backgroundEvent instanceof ErrorEvent))
                 return false;
 
-            RuntimeException exception = ((ErrorBackgroundEvent) backgroundEvent).error();
+            RuntimeException exception = ((ErrorEvent) backgroundEvent).error();
 
             if (!(exception instanceof GroupAuthorizationException))
                 return false;
@@ -188,7 +270,6 @@ public class CoordinatorRequestManagerTest {
 
     private CoordinatorRequestManager setupCoordinatorManager(String groupId) {
         return new CoordinatorRequestManager(
-            time,
             new LogContext(),
             RETRY_BACKOFF_MS,
             RETRY_BACKOFF_MS,
@@ -202,7 +283,7 @@ public class CoordinatorRequestManagerTest {
         Errors error
     ) {
         AbstractRequest abstractRequest = request.requestBuilder().build();
-        assertTrue(abstractRequest instanceof FindCoordinatorRequest);
+        assertInstanceOf(FindCoordinatorRequest.class, abstractRequest);
         FindCoordinatorRequest findCoordinatorRequest = (FindCoordinatorRequest) abstractRequest;
 
         FindCoordinatorResponse findCoordinatorResponse =

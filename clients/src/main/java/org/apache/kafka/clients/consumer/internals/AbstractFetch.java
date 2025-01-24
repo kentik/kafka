@@ -38,6 +38,7 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Timer;
 import org.apache.kafka.common.utils.Utils;
+
 import org.slf4j.Logger;
 import org.slf4j.helpers.MessageFormatter;
 
@@ -229,7 +230,7 @@ public abstract class AbstractFetch implements Closeable {
                 );
             }
 
-            metricsManager.recordLatency(resp.requestLatencyMs());
+            metricsManager.recordLatency(resp.destination(), resp.requestLatencyMs());
         } finally {
             removePendingFetchRequest(fetchTarget, data.metadata().sessionId());
         }
@@ -376,25 +377,21 @@ public abstract class AbstractFetch implements Closeable {
         final Cluster cluster = metadata.fetch();
         Map<Node, FetchSessionHandler.Builder> fetchable = new HashMap<>();
 
-        try {
-            sessionHandlers.forEach((fetchTargetNodeId, sessionHandler) -> {
-                // set the session handler to notify close. This will set the next metadata request to send close message.
-                sessionHandler.notifyClose();
+        sessionHandlers.forEach((fetchTargetNodeId, sessionHandler) -> {
+            // set the session handler to notify close. This will set the next metadata request to send close message.
+            sessionHandler.notifyClose();
 
-                // FetchTargetNode may not be available as it may have disconnected the connection. In such cases, we will
-                // skip sending the close request.
-                final Node fetchTarget = cluster.nodeById(fetchTargetNodeId);
+            // FetchTargetNode may not be available as it may have disconnected the connection. In such cases, we will
+            // skip sending the close request.
+            final Node fetchTarget = cluster.nodeById(fetchTargetNodeId);
 
-                if (fetchTarget == null || isUnavailable(fetchTarget)) {
-                    log.debug("Skip sending close session request to broker {} since it is not reachable", fetchTarget);
-                    return;
-                }
+            if (fetchTarget == null || isUnavailable(fetchTarget)) {
+                log.debug("Skip sending close session request to broker {} since it is not reachable", fetchTarget);
+                return;
+            }
 
-                fetchable.put(fetchTarget, sessionHandler.newBuilder());
-            });
-        } finally {
-            sessionHandlers.clear();
-        }
+            fetchable.put(fetchTarget, sessionHandler.newBuilder());
+        });
 
         return fetchable.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().build()));
     }
@@ -419,7 +416,7 @@ public abstract class AbstractFetch implements Closeable {
 
             Optional<Node> leaderOpt = position.currentLeader.leader;
 
-            if (!leaderOpt.isPresent()) {
+            if (leaderOpt.isEmpty()) {
                 log.debug("Requesting metadata update for partition {} since the position {} is missing the current leader node", partition, position);
                 metadata.requestUpdate(false);
                 continue;

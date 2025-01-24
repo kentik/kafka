@@ -99,7 +99,7 @@ public class KTableRepartitionMap<K, V, K1, V1> implements KTableRepartitionMapS
                 return true;
             }
 
-            switch (UpgradeFromValues.getValueFromString((String) upgradeFrom)) {
+            switch (UpgradeFromValues.fromString((String) upgradeFrom)) {
                 case UPGRADE_FROM_0100:
                 case UPGRADE_FROM_0101:
                 case UPGRADE_FROM_0102:
@@ -213,7 +213,7 @@ public class KTableRepartitionMap<K, V, K1, V1> implements KTableRepartitionMapS
         private ValueAndTimestamp<KeyValue<K1, V1>> mapValue(final K key, final ValueAndTimestamp<V> valueAndTimestamp) {
             return ValueAndTimestamp.make(
                 mapper.apply(key, getValueOrNull(valueAndTimestamp)),
-                valueAndTimestamp == null ? context.timestamp() : valueAndTimestamp.timestamp()
+                valueAndTimestamp == null ? context.recordContext().timestamp() : valueAndTimestamp.timestamp()
             );
         }
     }
