@@ -26,16 +26,16 @@ import com.typesafe.scalalogging.Logger
 
 import javax.management._
 import scala.collection._
-import scala.collection.{Seq, mutable}
+import scala.collection.Seq
 import kafka.cluster.EndPoint
 import org.apache.commons.validator.routines.InetAddressValidator
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.network.SocketServerConfigs
 import org.slf4j.event.Level
 
 import java.util
-import scala.annotation.nowarn
 import scala.jdk.CollectionConverters._
 
 /**
@@ -110,38 +110,10 @@ object CoreUtils {
   }
 
   /**
-   * This method gets comma separated values which contains key,value pairs and returns a map of
-   * key value pairs. the format of allCSVal is key1:val1, key2:val2 ....
-   * Also supports strings with multiple ":" such as IpV6 addresses, taking the last occurrence
-   * of the ":" in the pair as the split, eg a:b:c:val1, d:e:f:val2 => a:b:c -> val1, d:e:f -> val2
-   */
-  def parseCsvMap(str: String): Map[String, String] = {
-    val map = new mutable.HashMap[String, String]
-    if ("".equals(str))
-      return map
-    val keyVals = str.split("\\s*,\\s*").map(s => {
-      val lio = s.lastIndexOf(":")
-      (s.substring(0,lio).trim, s.substring(lio + 1).trim)
-    })
-    keyVals.toMap
-  }
-
-  /**
-   * Parse a comma separated string into a sequence of strings.
-   * Whitespace surrounding the comma will be removed.
-   */
-  def parseCsvList(csvList: String): Seq[String] = {
-    if (csvList == null || csvList.isEmpty)
-      Seq.empty[String]
-    else
-      csvList.split("\\s*,\\s*").filter(v => !v.equals(""))
-  }
-
-  /**
    * Create an instance of the class with the given class name
    */
   def createObject[T <: AnyRef](className: String, args: AnyRef*): T = {
-    val klass = Class.forName(className, true, Utils.getContextOrKafkaClassLoader).asInstanceOf[Class[T]]
+    val klass = Utils.loadClass(className, classOf[Object]).asInstanceOf[Class[T]]
     val constructor = klass.getConstructor(args.map(_.getClass): _*)
     constructor.newInstance(args: _*)
   }
@@ -176,7 +148,7 @@ object CoreUtils {
     listenerListToEndPoints(listeners, securityProtocolMap, requireDistinctPorts = true)
   }
 
-  def checkDuplicateListenerPorts(endpoints: Seq[EndPoint], listeners: String): Unit = {
+  private def checkDuplicateListenerPorts(endpoints: Seq[EndPoint], listeners: String): Unit = {
     val distinctPorts = endpoints.map(_.port).distinct
     require(distinctPorts.size == endpoints.map(_.port).size, s"Each listener must have a different port, listeners: $listeners")
   }
@@ -236,8 +208,8 @@ object CoreUtils {
     }
 
     val endPoints = try {
-      val listenerList = parseCsvList(listeners)
-      listenerList.map(EndPoint.createEndPoint(_, Some(securityProtocolMap)))
+      SocketServerConfigs.listenerListToEndPoints(listeners, securityProtocolMap.asJava).
+        asScala.map(EndPoint.fromJava(_))
     } catch {
       case e: Exception =>
         throw new IllegalArgumentException(s"Error creating broker listeners from '$listeners': ${e.getMessage}", e)
@@ -267,31 +239,6 @@ object CoreUtils {
     val properties = new Properties()
     props.foreach { case (k, v) => properties.put(k, v) }
     properties
-  }
-
-  /**
-   * Atomic `getOrElseUpdate` for concurrent maps. This is optimized for the case where
-   * keys often exist in the map, avoiding the need to create a new value. `createValue`
-   * may be invoked more than once if multiple threads attempt to insert a key at the same
-   * time, but the same inserted value will be returned to all threads.
-   *
-   * In Scala 2.12, `ConcurrentMap.getOrElse` has the same behaviour as this method, but JConcurrentMapWrapper that
-   * wraps Java maps does not.
-   */
-  def atomicGetOrUpdate[K, V](map: concurrent.Map[K, V], key: K, createValue: => V): V = {
-    map.get(key) match {
-      case Some(value) => value
-      case None =>
-        val value = createValue
-        map.putIfAbsent(key, value).getOrElse(value)
-    }
-  }
-
-  @nowarn("cat=unused") // see below for explanation
-  def groupMapReduce[T, K, B](elements: Iterable[T])(key: T => K)(f: T => B)(reduce: (B, B) => B): Map[K, B] = {
-    // required for Scala 2.12 compatibility, unused in Scala 2.13 and hence we need to suppress the unused warning
-    import scala.collection.compat._
-    elements.groupMapReduce(key)(f)(reduce)
   }
 
   def replicaToBrokerAssignmentAsScala(map: util.Map[Integer, util.List[Integer]]): Map[Int, Seq[Int]] = {

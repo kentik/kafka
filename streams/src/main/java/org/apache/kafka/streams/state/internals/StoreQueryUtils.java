@@ -125,28 +125,30 @@ public final class StoreQueryUtils {
         final QueryResult<R> result;
 
         final QueryHandler handler = QUERY_HANDLER_MAP.get(query.getClass());
-        if (handler == null) {
-            result = QueryResult.forUnknownQueryType(query, store);
-        } else if (context == null || !isPermitted(position, positionBound, context.taskId().partition())) {
-            result = QueryResult.notUpToBound(
-                position,
-                positionBound,
-                context == null ? null : context.taskId().partition()
-            );
-        } else {
-            result = (QueryResult<R>) handler.apply(
-                query,
-                positionBound,
-                config,
-                store
-            );
+        synchronized (position) {
+            if (handler == null) {
+                result = QueryResult.forUnknownQueryType(query, store);
+            } else if (context == null || !isPermitted(position, positionBound, context.taskId().partition())) {
+                result = QueryResult.notUpToBound(
+                    position,
+                    positionBound,
+                    context == null ? null : context.taskId().partition()
+                );
+            } else {
+                result = (QueryResult<R>) handler.apply(
+                    query,
+                    positionBound,
+                    config,
+                    store
+                );
+            }
+            if (config.isCollectExecutionInfo()) {
+                result.addExecutionInfo(
+                    "Handled in " + store.getClass() + " in " + (System.nanoTime() - start) + "ns"
+                );
+            }
+            result.setPosition(position.copy());
         }
-        if (config.isCollectExecutionInfo()) {
-            result.addExecutionInfo(
-                "Handled in " + store.getClass() + " in " + (System.nanoTime() - start) + "ns"
-            );
-        }
-        result.setPosition(position);
         return result;
     }
 
@@ -203,11 +205,11 @@ public final class StoreQueryUtils {
         final ResultOrder order = rangeQuery.resultOrder();
         final KeyValueIterator<Bytes, byte[]> iterator;
         try {
-            if (!lowerRange.isPresent() && !upperRange.isPresent() && !order.equals(ResultOrder.DESCENDING)) {
+            if (lowerRange.isEmpty() && upperRange.isEmpty() && !order.equals(ResultOrder.DESCENDING)) {
                 iterator = kvStore.all();
             } else if (!order.equals(ResultOrder.DESCENDING)) {
                 iterator = kvStore.range(lowerRange.orElse(null), upperRange.orElse(null));
-            } else if (!lowerRange.isPresent() && !upperRange.isPresent()) {
+            } else if (lowerRange.isEmpty() && upperRange.isEmpty()) {
                 iterator = kvStore.reverseAll();
             } else {
                 iterator = kvStore.reverseRange(lowerRange.orElse(null), upperRange.orElse(null));
@@ -408,7 +410,7 @@ public final class StoreQueryUtils {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    public static <V> Function<byte[], V> getDeserializeValue(final StateSerdes<?, V> serdes, final StateStore wrapped) {
+    public static <V> Function<byte[], V> deserializeValue(final StateSerdes<?, V> serdes, final StateStore wrapped) {
         final Serde<V> valueSerde = serdes.valueSerde();
         final boolean timestamped = WrappedStateStore.isTimestamped(wrapped) || isAdapter(wrapped);
         final Deserializer<V> deserializer;
@@ -433,7 +435,7 @@ public final class StoreQueryUtils {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    public static <V> Function<VersionedRecord<byte[]>, VersionedRecord<V>> getDeserializeValue(final StateSerdes<?, V> serdes) {
+    public static <V> Function<VersionedRecord<byte[]>, VersionedRecord<V>> deserializeValue(final StateSerdes<?, V> serdes) {
         final Serde<V> valueSerde = serdes.valueSerde();
         final Deserializer<V> deserializer = valueSerde.deserializer();
         return rawVersionedRecord -> rawVersionedRecord.validTo().isPresent() ? new VersionedRecord<>(deserializer.deserialize(serdes.topic(), rawVersionedRecord.value()),

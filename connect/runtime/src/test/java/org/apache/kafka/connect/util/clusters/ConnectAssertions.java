@@ -21,10 +21,10 @@ import org.apache.kafka.connect.runtime.AbstractStatus;
 import org.apache.kafka.connect.runtime.rest.entities.ActiveTopicsInfo;
 import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
 import org.apache.kafka.connect.runtime.rest.errors.ConnectRestException;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.ws.rs.core.Response;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
@@ -36,6 +36,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+
+import jakarta.ws.rs.core.Response;
 
 import static org.apache.kafka.test.TestUtils.waitForCondition;
 
@@ -76,7 +78,7 @@ public class ConnectAssertions {
     }
 
     /**
-     * Assert that at least the requested number of workers are up and running.
+     * Assert that the exact number of workers are up and running.
      *
      * @param numWorkers the number of online workers
      */
@@ -99,7 +101,7 @@ public class ConnectAssertions {
      */
     protected Optional<Boolean> checkWorkersUp(int numWorkers, BiFunction<Integer, Integer, Boolean> comp) {
         try {
-            int numUp = connect.activeWorkers().size();
+            int numUp = connect.healthyWorkers().size();
             return Optional.of(comp.apply(numUp, numWorkers));
         } catch (Exception e) {
             log.error("Could not check active workers.", e);
@@ -425,6 +427,29 @@ public class ConnectAssertions {
                 null,
                 AbstractStatus.State.FAILED,
                 "Either the connector is running or not all the " + numTasks + " tasks have failed.",
+                detailMessage,
+                CONNECTOR_SETUP_DURATION_MS
+        );
+    }
+
+    /**
+     * Assert that a connector is in FAILED state, that it has a specific number of tasks, and that all of
+     * its tasks are in the RUNNING state.
+     *
+     * @param connectorName the connector name
+     * @param numTasks the number of tasks
+     * @param detailMessage the assertion message
+     * @throws InterruptedException
+     */
+    public void assertConnectorIsFailedAndNumTasksAreRunning(String connectorName, int numTasks, String detailMessage)
+            throws InterruptedException {
+        waitForConnectorState(
+                connectorName,
+                AbstractStatus.State.FAILED,
+                exactly(numTasks),
+                null,
+                AbstractStatus.State.RUNNING,
+                "Either the connector is running or not all the " + numTasks + " tasks are running.",
                 detailMessage,
                 CONNECTOR_SETUP_DURATION_MS
         );

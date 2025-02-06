@@ -19,8 +19,7 @@ from ducktape.tests.test import Test
 from ducktape.mark import matrix
 from ducktape.mark.resource import cluster
 
-from kafkatest.services.zookeeper import ZookeeperService
-from kafkatest.services.kafka import KafkaService, quorum
+from kafkatest.services.kafka import KafkaService, quorum, consumer_group
 from kafkatest.services.console_consumer import ConsoleConsumer
 from kafkatest.services.security.security_config import SecurityConfig
 
@@ -40,33 +39,28 @@ class ConsumerGroupCommandTest(Test):
 
     def __init__(self, test_context):
         super(ConsumerGroupCommandTest, self).__init__(test_context)
-        self.num_zk = 1
         self.num_brokers = 1
         self.topics = {
             TOPIC: {'partitions': 1, 'replication-factor': 1}
         }
-        self.zk = ZookeeperService(test_context, self.num_zk) if quorum.for_test(test_context) == quorum.zk else None
-
-    def setUp(self):
-        if self.zk:
-            self.zk.start()
 
     def start_kafka(self, security_protocol, interbroker_security_protocol):
         self.kafka = KafkaService(
             self.test_context, self.num_brokers,
-            self.zk, security_protocol=security_protocol,
+            None, security_protocol=security_protocol,
             interbroker_security_protocol=interbroker_security_protocol, topics=self.topics,
-            controller_num_nodes_override=self.num_zk)
+            controller_num_nodes_override=self.num_brokers)
         self.kafka.start()
 
-    def start_consumer(self):
+    def start_consumer(self, group_protocol=None):
+        consumer_properties = consumer_group.maybe_set_group_protocol(group_protocol)
         self.consumer = ConsoleConsumer(self.test_context, num_nodes=self.num_brokers, kafka=self.kafka, topic=TOPIC,
-                                        consumer_timeout_ms=None)
+                                        consumer_timeout_ms=None, consumer_properties=consumer_properties)
         self.consumer.start()
 
-    def setup_and_verify(self, security_protocol, group=None):
+    def setup_and_verify(self, security_protocol, group=None, group_protocol=None):
         self.start_kafka(security_protocol, security_protocol)
-        self.start_consumer()
+        self.start_consumer(group_protocol=group_protocol)
         consumer_node = self.consumer.nodes[0]
         wait_until(lambda: self.consumer.alive(consumer_node),
                    timeout_sec=20, backoff_sec=.2, err_msg="Consumer was too slow to start")
@@ -92,35 +86,37 @@ class ConsumerGroupCommandTest(Test):
     @cluster(num_nodes=3)
     @matrix(
         security_protocol=['PLAINTEXT', 'SSL'],
-        metadata_quorum=[quorum.zk],
+        metadata_quorum=[quorum.isolated_kraft],
         use_new_coordinator=[False]
     )
     @matrix(
         security_protocol=['PLAINTEXT', 'SSL'],
         metadata_quorum=[quorum.isolated_kraft],
-        use_new_coordinator=[True, False]
+        use_new_coordinator=[True],
+        group_protocol=consumer_group.all_group_protocols
     )
-    def test_list_consumer_groups(self, security_protocol='PLAINTEXT', metadata_quorum=quorum.zk, use_new_coordinator=False):
+    def test_list_consumer_groups(self, security_protocol='PLAINTEXT', metadata_quorum=quorum.isolated_kraft, use_new_coordinator=False, group_protocol=None):
         """
         Tests if ConsumerGroupCommand is listing correct consumer groups
         :return: None
         """
-        self.setup_and_verify(security_protocol)
+        self.setup_and_verify(security_protocol, group_protocol=group_protocol)
 
     @cluster(num_nodes=3)
     @matrix(
         security_protocol=['PLAINTEXT', 'SSL'],
-        metadata_quorum=[quorum.zk],
+        metadata_quorum=[quorum.isolated_kraft],
         use_new_coordinator=[False]
     )
     @matrix(
         security_protocol=['PLAINTEXT', 'SSL'],
         metadata_quorum=[quorum.isolated_kraft],
-        use_new_coordinator=[True, False]
+        use_new_coordinator=[True],
+        group_protocol=consumer_group.all_group_protocols
     )
-    def test_describe_consumer_group(self, security_protocol='PLAINTEXT', metadata_quorum=quorum.zk, use_new_coordinator=False):
+    def test_describe_consumer_group(self, security_protocol='PLAINTEXT', metadata_quorum=quorum.isolated_kraft, use_new_coordinator=False, group_protocol=None):
         """
         Tests if ConsumerGroupCommand is describing a consumer group correctly
         :return: None
         """
-        self.setup_and_verify(security_protocol, group="test-consumer-group")
+        self.setup_and_verify(security_protocol, group="test-consumer-group", group_protocol=group_protocol)

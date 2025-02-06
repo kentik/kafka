@@ -18,9 +18,16 @@ package org.apache.kafka.coordinator.group;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.message.ListGroupsResponseData;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Interface common for all groups.
@@ -28,7 +35,9 @@ import java.util.Optional;
 public interface Group {
     enum GroupType {
         CONSUMER("consumer"),
-        CLASSIC("classic");
+        CLASSIC("classic"),
+        SHARE("share"),
+        UNKNOWN("unknown");
 
         private final String name;
 
@@ -39,6 +48,31 @@ public interface Group {
         @Override
         public String toString() {
             return name;
+        }
+
+        private static final Map<String, GroupType> NAME_TO_ENUM = Arrays.stream(values())
+            .collect(Collectors.toMap(type -> type.name.toLowerCase(Locale.ROOT), Function.identity()));
+
+        /**
+         * Parse a string into the corresponding {@code GroupType} enum value, in a case-insensitive manner.
+         *
+         * @return The {{@link GroupType}} according to the string passed. Unknown group type is returned if
+         * the string doesn't correspond to a valid group type.
+         */
+        public static GroupType parse(String name) {
+            if (name == null) {
+                return UNKNOWN;
+            }
+            GroupType type = NAME_TO_ENUM.get(name.toLowerCase(Locale.ROOT));
+
+            return type == null ? UNKNOWN : type;
+        }
+        
+        static String[] documentValidValues() {
+            return Arrays.stream(GroupType.values())
+                .filter(type -> type != UNKNOWN)
+                .map(GroupType::toString)
+                .toArray(String[]::new);
         }
     }
 
@@ -60,7 +94,7 @@ public interface Group {
     /**
      * @return the group formatted as a list group response based on the committed offset.
      */
-    public ListGroupsResponseData.ListedGroup asListedGroup(long committedOffset);
+    ListGroupsResponseData.ListedGroup asListedGroup(long committedOffset);
 
     /**
      * @return The group id.
@@ -75,12 +109,15 @@ public interface Group {
      * @param generationIdOrMemberEpoch The generation id for genetic groups or the member epoch
      *                                  for consumer groups.
      * @param isTransactional           Whether the offset commit is transactional or not.
+     * @param apiVersion                The api version.
      */
     void validateOffsetCommit(
         String memberId,
         String groupInstanceId,
         int generationIdOrMemberEpoch,
-        boolean isTransactional
+        boolean isTransactional,
+        short apiVersion
+
     ) throws KafkaException;
 
     /**
@@ -114,13 +151,13 @@ public interface Group {
      * @return Whether the group is subscribed to the topic.
      */
     boolean isSubscribedToTopic(String topic);
-    
+
     /**
      * Populates the list of records with tombstone(s) for deleting the group.
      *
      * @param records The list of records.
      */
-    void createGroupTombstoneRecords(List<Record> records);
+    void createGroupTombstoneRecords(List<CoordinatorRecord> records);
 
     /**
      * @return Whether the group is in Empty state.
@@ -133,4 +170,28 @@ public interface Group {
      * @return The offset expiration condition for the group or Empty if no such condition exists.
      */
     Optional<OffsetExpirationCondition> offsetExpirationCondition();
+
+    /**
+     * Returns true if the statesFilter contains the current state with given committedOffset.
+     *
+     * @param statesFilter The states to filter, which must be lowercase.
+     * @return true if the state includes, false otherwise.
+     */
+    boolean isInStates(Set<String> statesFilter, long committedOffset);
+
+    /**
+     * Returns true if the member exists.
+     *
+     * @param memberId The member id.
+     *
+     * @return A boolean indicating whether the member exists or not.
+     */
+    boolean hasMember(String memberId);
+
+    /**
+     * Returns number of members in the group.
+     *
+     * @return The number of members.
+     */
+    int numMembers();
 }

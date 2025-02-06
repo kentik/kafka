@@ -18,6 +18,7 @@ package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
@@ -29,6 +30,7 @@ import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+
 import org.slf4j.Logger;
 
 import java.util.ArrayDeque;
@@ -194,7 +196,7 @@ public class FetchCollector<K, V> {
                     metricsManager.recordPartitionLead(tp, lead);
                 }
 
-                return Fetch.forPartition(tp, partRecords, positionAdvanced);
+                return Fetch.forPartition(tp, partRecords, positionAdvanced, new OffsetAndMetadata(nextInLineFetch.nextFetchOffset(), nextInLineFetch.lastEpoch(), ""));
             } else {
                 // these records aren't next in line based on the last consumed position, ignore them
                 // they must be from an obsolete request
@@ -248,10 +250,10 @@ public class FetchCollector<K, V> {
 
         // we are interested in this fetch only if the beginning offset matches the
         // current consumed position
-        SubscriptionState.FetchPosition position = subscriptions.position(tp);
+        SubscriptionState.FetchPosition position = subscriptions.positionOrNull(tp);
         if (position == null || position.offset != fetchOffset) {
             log.debug("Discarding stale fetch response for partition {} since its offset {} does not match " +
-                    "the expected offset {}", tp, fetchOffset, position);
+                "the expected offset {} or the partition has been unassigned", tp, fetchOffset, position);
             return null;
         }
 
@@ -278,32 +280,48 @@ public class FetchCollector<K, V> {
             }
         }
 
-        if (partition.highWatermark() >= 0) {
-            log.trace("Updating high watermark for partition {} to {}", tp, partition.highWatermark());
-            subscriptions.updateHighWatermark(tp, partition.highWatermark());
-        }
-
-        if (partition.logStartOffset() >= 0) {
-            log.trace("Updating log start offset for partition {} to {}", tp, partition.logStartOffset());
-            subscriptions.updateLogStartOffset(tp, partition.logStartOffset());
-        }
-
-        if (partition.lastStableOffset() >= 0) {
-            log.trace("Updating last stable offset for partition {} to {}", tp, partition.lastStableOffset());
-            subscriptions.updateLastStableOffset(tp, partition.lastStableOffset());
-        }
-
-        if (FetchResponse.isPreferredReplica(partition)) {
-            subscriptions.updatePreferredReadReplica(completedFetch.partition, partition.preferredReadReplica(), () -> {
-                long expireTimeMs = time.milliseconds() + metadata.metadataExpireMs();
-                log.debug("Updating preferred read replica for partition {} to {}, set to expire at {}",
-                        tp, partition.preferredReadReplica(), expireTimeMs);
-                return expireTimeMs;
-            });
+        if (!updatePartitionState(partition, tp)) {
+            return null;
         }
 
         completedFetch.setInitialized();
         return completedFetch;
+    }
+
+    private boolean updatePartitionState(final FetchResponseData.PartitionData partitionData,
+                                         final TopicPartition tp) {
+        if (partitionData.highWatermark() >= 0) {
+            log.trace("Updating high watermark for partition {} to {}", tp, partitionData.highWatermark());
+            if (!subscriptions.tryUpdatingHighWatermark(tp, partitionData.highWatermark())) {
+                return false;
+            }
+        }
+
+        if (partitionData.logStartOffset() >= 0) {
+            log.trace("Updating log start offset for partition {} to {}", tp, partitionData.logStartOffset());
+            if (!subscriptions.tryUpdatingLogStartOffset(tp, partitionData.logStartOffset())) {
+                return false;
+            }
+        }
+
+        if (partitionData.lastStableOffset() >= 0) {
+            log.trace("Updating last stable offset for partition {} to {}", tp, partitionData.lastStableOffset());
+            if (!subscriptions.tryUpdatingLastStableOffset(tp, partitionData.lastStableOffset())) {
+                return false;
+            }
+        }
+
+        if (FetchResponse.isPreferredReplica(partitionData)) {
+            return subscriptions.tryUpdatingPreferredReadReplica(
+                tp, partitionData.preferredReadReplica(), () -> {
+                    long expireTimeMs = time.milliseconds() + metadata.metadataExpireMs();
+                    log.debug("Updating preferred read replica for partition {} to {}, set to expire at {}",
+                        tp, partitionData.preferredReadReplica(), expireTimeMs);
+                    return expireTimeMs;
+                });
+        }
+
+        return true;
     }
 
     private void handleInitializeErrors(final CompletedFetch completedFetch, final Errors error) {
@@ -329,19 +347,19 @@ public class FetchCollector<K, V> {
         } else if (error == Errors.OFFSET_OUT_OF_RANGE) {
             Optional<Integer> clearedReplicaId = subscriptions.clearPreferredReadReplica(tp);
 
-            if (!clearedReplicaId.isPresent()) {
+            if (clearedReplicaId.isEmpty()) {
                 // If there's no preferred replica to clear, we're fetching from the leader so handle this error normally
-                SubscriptionState.FetchPosition position = subscriptions.position(tp);
+                SubscriptionState.FetchPosition position = subscriptions.positionOrNull(tp);
 
                 if (position == null || fetchOffset != position.offset) {
                     log.debug("Discarding stale fetch response for partition {} since the fetched offset {} " +
-                            "does not match the current offset {}", tp, fetchOffset, position);
+                            "does not match the current offset {} or the partition has been unassigned", tp, fetchOffset, position);
                 } else {
                     String errorMessage = "Fetch position " + position + " is out of range for partition " + tp;
 
                     if (subscriptions.hasDefaultOffsetResetPolicy()) {
                         log.info("{}, resetting offset", errorMessage);
-                        subscriptions.requestOffsetReset(tp);
+                        subscriptions.requestOffsetResetIfPartitionAssigned(tp);
                     } else {
                         log.info("{}, raising error to the application since no reset policy is configured", errorMessage);
                         throw new OffsetOutOfRangeException(errorMessage,

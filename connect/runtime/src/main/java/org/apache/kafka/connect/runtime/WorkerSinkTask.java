@@ -16,12 +16,12 @@
  */
 package org.apache.kafka.connect.runtime;
 
+import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
-import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
@@ -54,12 +54,14 @@ import org.apache.kafka.connect.storage.HeaderConverter;
 import org.apache.kafka.connect.storage.StatusBackingStore;
 import org.apache.kafka.connect.util.ConnectUtils;
 import org.apache.kafka.connect.util.ConnectorTaskId;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,7 +75,7 @@ import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABL
 /**
  * {@link WorkerTask} that uses a {@link SinkTask} to export data from Kafka.
  */
-class WorkerSinkTask extends WorkerTask {
+class WorkerSinkTask extends WorkerTask<ConsumerRecord<byte[], byte[]>, SinkRecord> {
     private static final Logger log = LoggerFactory.getLogger(WorkerSinkTask.class);
 
     private final WorkerConfig workerConfig;
@@ -83,7 +85,6 @@ class WorkerSinkTask extends WorkerTask {
     private final Converter keyConverter;
     private final Converter valueConverter;
     private final HeaderConverter headerConverter;
-    private final TransformationChain<SinkRecord> transformationChain;
     private final SinkTaskMetricsGroup sinkTaskMetricsGroup;
     private final boolean isTopicTrackingEnabled;
     private final Consumer<byte[], byte[]> consumer;
@@ -101,7 +102,6 @@ class WorkerSinkTask extends WorkerTask {
     private boolean committing;
     private boolean taskStopped;
     private final WorkerErrantRecordReporter workerErrantRecordReporter;
-    private final Supplier<List<ErrorReporter>> errorReportersSupplier;
 
     public WorkerSinkTask(ConnectorTaskId id,
                           SinkTask task,
@@ -114,16 +114,16 @@ class WorkerSinkTask extends WorkerTask {
                           Converter valueConverter,
                           ErrorHandlingMetrics errorMetrics,
                           HeaderConverter headerConverter,
-                          TransformationChain<SinkRecord> transformationChain,
+                          TransformationChain<ConsumerRecord<byte[], byte[]>, SinkRecord> transformationChain,
                           Consumer<byte[], byte[]> consumer,
                           ClassLoader loader,
                           Time time,
-                          RetryWithToleranceOperator retryWithToleranceOperator,
+                          RetryWithToleranceOperator<ConsumerRecord<byte[], byte[]>> retryWithToleranceOperator,
                           WorkerErrantRecordReporter workerErrantRecordReporter,
                           StatusBackingStore statusBackingStore,
-                          Supplier<List<ErrorReporter>> errorReportersSupplier) {
+                          Supplier<List<ErrorReporter<ConsumerRecord<byte[], byte[]>>>> errorReportersSupplier) {
         super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,
-                retryWithToleranceOperator, time, statusBackingStore);
+                retryWithToleranceOperator, transformationChain, errorReportersSupplier, time, statusBackingStore);
 
         this.workerConfig = workerConfig;
         this.task = task;
@@ -131,7 +131,6 @@ class WorkerSinkTask extends WorkerTask {
         this.keyConverter = keyConverter;
         this.valueConverter = valueConverter;
         this.headerConverter = headerConverter;
-        this.transformationChain = transformationChain;
         this.messageBatch = new ArrayList<>();
         this.lastCommittedOffsets = new HashMap<>();
         this.currentOffsets = new HashMap<>();
@@ -150,7 +149,6 @@ class WorkerSinkTask extends WorkerTask {
         this.isTopicTrackingEnabled = workerConfig.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);
         this.taskStopped = false;
         this.workerErrantRecordReporter = workerErrantRecordReporter;
-        this.errorReportersSupplier = errorReportersSupplier;
     }
 
     @Override
@@ -182,8 +180,6 @@ class WorkerSinkTask extends WorkerTask {
         }
         taskStopped = true;
         Utils.closeQuietly(consumer, "consumer");
-        Utils.closeQuietly(transformationChain, "transformation chain");
-        Utils.closeQuietly(retryWithToleranceOperator, "retry operator");
         Utils.closeQuietly(headerConverter, "header converter");
         /*
             Setting partition count explicitly to 0 to handle the case,
@@ -232,7 +228,7 @@ class WorkerSinkTask extends WorkerTask {
 
             // Maybe commit
             if (!committing && (context.isCommitRequested() || now >= nextCommit)) {
-                commitOffsets(now, false);
+                commitOffsets(now);
                 nextCommit = now + offsetCommitIntervalMs;
                 context.clearCommitRequest();
             }
@@ -286,7 +282,7 @@ class WorkerSinkTask extends WorkerTask {
                 log.error("{} Commit of offsets threw an unexpected exception for sequence number {}: {}",
                         this, seqno, committedOffsets, error);
                 commitFailures++;
-                recordCommitFailure(durationMillis, error);
+                recordCommitFailure(durationMillis);
             } else {
                 log.debug("{} Finished offset commit successfully in {} ms for sequence number {}: {}",
                         this, durationMillis, seqno, committedOffsets);
@@ -313,11 +309,10 @@ class WorkerSinkTask extends WorkerTask {
     @Override
     protected void initializeAndStart() {
         SinkConnectorConfig.validate(taskConfig);
-        retryWithToleranceOperator.reporters(errorReportersSupplier.get());
         if (SinkConnectorConfig.hasTopicsConfig(taskConfig)) {
             List<String> topics = SinkConnectorConfig.parseTopicsList(taskConfig);
             consumer.subscribe(topics, new HandleRebalance());
-            log.debug("{} Initializing and starting task for topics {}", this, Utils.join(topics, ", "));
+            log.debug("{} Initializing and starting task for topics {}", this, String.join(", ", topics));
         } else {
             String topicsRegexStr = taskConfig.get(SinkTask.TOPICS_REGEX_CONFIG);
             Pattern pattern = Pattern.compile(topicsRegexStr);
@@ -350,9 +345,19 @@ class WorkerSinkTask extends WorkerTask {
         deliverMessages();
     }
 
-    // Visible for testing
+    // VisibleForTesting
     boolean isCommitting() {
         return committing;
+    }
+
+    //VisibleForTesting
+    Map<TopicPartition, OffsetAndMetadata> lastCommittedOffsets() {
+        return Collections.unmodifiableMap(lastCommittedOffsets);
+    }
+
+    //VisibleForTesting
+    Map<TopicPartition, OffsetAndMetadata> currentOffsets() {
+        return Collections.unmodifiableMap(currentOffsets);
     }
 
     private void doCommitSync(Map<TopicPartition, OffsetAndMetadata> offsets, int seqno) {
@@ -391,8 +396,8 @@ class WorkerSinkTask extends WorkerTask {
         }
     }
 
-    private void commitOffsets(long now, boolean closing) {
-        commitOffsets(now, closing, consumer.assignment());
+    private void commitOffsets(long now) {
+        commitOffsets(now, false, consumer.assignment());
     }
 
     private void commitOffsets(long now, boolean closing, Collection<TopicPartition> topicPartitions) {
@@ -790,8 +795,6 @@ class WorkerSinkTask extends WorkerTask {
     }
 
     static class SinkTaskMetricsGroup {
-        private final ConnectorTaskId id;
-        private final ConnectMetrics metrics;
         private final MetricGroup metricGroup;
         private final Sensor sinkRecordRead;
         private final Sensor sinkRecordSend;
@@ -801,13 +804,10 @@ class WorkerSinkTask extends WorkerTask {
         private final Sensor offsetCompletionSkip;
         private final Sensor putBatchTime;
         private final Sensor sinkRecordActiveCount;
-        private long activeRecords;
         private Map<TopicPartition, OffsetAndMetadata> consumedOffsets = new HashMap<>();
         private Map<TopicPartition, OffsetAndMetadata> committedOffsets = new HashMap<>();
 
         public SinkTaskMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics) {
-            this.metrics = connectMetrics;
-            this.id = id;
 
             ConnectMetricsRegistry registry = connectMetrics.registry();
             metricGroup = connectMetrics
@@ -851,7 +851,7 @@ class WorkerSinkTask extends WorkerTask {
         void computeSinkRecordLag() {
             Map<TopicPartition, OffsetAndMetadata> consumed = this.consumedOffsets;
             Map<TopicPartition, OffsetAndMetadata> committed = this.committedOffsets;
-            activeRecords = 0L;
+            long activeRecords = 0L;
             for (Map.Entry<TopicPartition, OffsetAndMetadata> committedOffsetEntry : committed.entrySet()) {
                 final TopicPartition partition = committedOffsetEntry.getKey();
                 final OffsetAndMetadata consumedOffsetMeta = consumed.get(partition);
